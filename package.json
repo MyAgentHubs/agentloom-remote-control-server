@@ -1,0 +1,16 @@
+{
+  "name": "agentloom-remote-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AgentLoom Remote Control relay：Cloudflare Workers + Durable Objects 实现的端到端加密中转服务器",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
