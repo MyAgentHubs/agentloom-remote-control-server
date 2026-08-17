@@ -348,6 +348,16 @@ export class RoomDO {
 
     if (admission.scope === "remote") {
       this.replayTo(server, requestedLastSeq);
+      // C1-PS（dogfood 修障第二批·手机发消息桌面离线无反馈）：remote 腿刚接入时拿不到当前桌面在线态——
+      // presence 帧只在状态**变化**时广播（webSocketClose/broadcastReplacedDesktopOffline/
+      // handleTokenReconcile 上线），发生在这条新连接接入之前的任何变化，它都是盲的，
+      // 只能干等下一次真实变化才第一次收到一条 presence。这里定向回一条当前快照，只发
+      // 给这条新 socket、不广播（其它已在线的远端不需要、也不该收到重复快照）。
+      // R5（返工·快照陈旧 epoch）：不复用第 313 行捕获的局部 `epoch`——那个值与这里之间
+      // 隔着一次真 `await`（上面 `scheduleNextTokenAlarm()`），理论上存在桌面在这段窗口内
+      // 抢先重连、epoch 又被 bump 一次的交错可能。现算 `store.getCurrentEpoch(this.sql)`，
+      // 保证快照用的是此刻真正权威的 epoch，不是握手最开始那一刻的快照值。
+      this.sendDesktopPresenceSnapshot(server, store.getCurrentEpoch(this.sql));
     }
     if (role !== "desktop") this.broadcastPresence(role, "online", server);
 
@@ -666,6 +676,12 @@ export class RoomDO {
     // R1（§9.6 第 249 行）：过期 refresh_requests 行真删，不只是查询时过滤——
     // 见 room-store.js deleteExpiredRefreshRequests 头注释。
     store.deleteExpiredRefreshRequests(this.sql, Date.now());
+    // C1-TTL（dogfood 修障第二批·手机发消息桌面离线无反馈）：pending_input
+    // TTL 清扫的 alarm 兜底——之前只有 handleInput 高频路径里顺带清一次，房间
+    // 若从此再没有新 input 涌入，早该过期的暂存行会一直滞留、input.expired
+    // 回执永远等不到。purgeExpiredPendingInput 内部已会广播 input.expired
+    // （见其头注释）。
+    this.purgeExpiredPendingInput(Date.now());
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = safeAttachment(ws);
       if (attachment.role === "desktop" && attachment.scope === "desktop" &&
@@ -776,12 +792,25 @@ export class RoomDO {
     // 不该继续占着行数/字节容量，不清的话，房间可能因为一堆早该过期的旧行
     // 占满 256 行/4MB，把新的、真正需要暂存的 input 挤成假 queue_full。
     this.purgeExpiredPendingInput(Date.now());
+    // C1-TTL（dogfood 修障第二批·手机发消息桌面离线无反馈）：清扫可能刚删掉
+    // 了曾是现排 alarm 依据的那一行——重算一次 min（同款
+    // handleTokenRefresh/handleTokenReconcile 既有 fire-and-forget 写法，
+    // 「入队/补投/清扫后都重算」三处纪律之一）。
+    void this.scheduleNextTokenAlarm();
 
     // G8 R4：幂等先于容量——同一个 command_id 重试（比如手机没收到上一次的
     // 确认、超时重发）本就不会让表再多一行（enqueueInput 是 ON CONFLICT
     // DO NOTHING），不该被容量闸误伤：不判断的话，队列刚好满员时的一次
     // 无害重试会被 rowCount>=LIMIT 挡下、回一个名不副实的 queue_full。
-    if (store.hasPendingInputCommandId(this.sql, commandId)) return;
+    // C1-RQ：幂等命中现在也要回一条 input.relay_queued（拿既存行的
+    // expires_at）——之前这里直接空手 return，手机端第一次的确认没收到
+    // （进程重启/掉线重连）时，重试一次只换来沉默，跟第一次发送时桌面离线
+    // 那声不吭是同一种不对称，这次一并补上。
+    const existingExpiry = store.getPendingInputExpiry(this.sql, commandId);
+    if (existingExpiry != null) {
+      ws.send(JSON.stringify({ t: "input.relay_queued", command_id: commandId, expires_at: existingExpiry }));
+      return;
+    }
 
     // G8 威胁模型②：桌面离线时无限撑 pending_input——入队前核该房现存行数/
     // 总字节，任一超限就不入队，回 queue_full；不影响已暂存的行。
@@ -796,7 +825,13 @@ export class RoomDO {
       return;
     }
 
-    store.enqueueInput(this.sql, {
+    // C1-RQ（dogfood 修障第二批·手机发消息桌面离线无反馈）：handleInput 之前
+    // 把 input 存进 pending_input 后一声不吭——对比 handleControl 同场景回
+    // desktop_offline 错误帧，这里不对称（消息没丢，只是没反馈）。现在成功
+    // 入队后回一条新帧 input.relay_queued（不是 input.ack——那个语义是「桌面
+    // 已接收」；也不是 error——消息并没失败），带上这次真正生效的 expires_at
+    // 让手机端知道大概什么时候该放弃等待。
+    const enqueued = store.enqueueInput(this.sql, {
       commandId,
       session: envelope.session,
       envelopeJson,
@@ -804,6 +839,8 @@ export class RoomDO {
       subject: safeAttachment(ws).subject ?? null,
       generation: safeAttachment(ws).generation ?? null,
     });
+    ws.send(JSON.stringify({ t: "input.relay_queued", command_id: commandId, expires_at: enqueued.expiresAt }));
+    void this.scheduleNextTokenAlarm();
   }
 
   // ---- kind=control：即刻投递、不暂存；桌面离线则丢弃并告知发送方 ----
@@ -829,9 +866,25 @@ export class RoomDO {
   // ---- 明文控制帧 ----
   handlePlainFrame(ws, payload, role) {
     switch (payload.t) {
-      case "presence":
+      case "presence": {
+        // R3（返工·硬化）：remote scope 本就放行 presence 帧（INBOUND_SCOPE_MATRIX.remote
+        // 含 "presence"），但这不代表"任意角色的 presence 内容都能广播"——payload.role 是
+        // 发送方自报的字段，relay 从不校验它与真实连接角色是否一致；不加这道检查，任何
+        // 已授权远端都能伪造 {t:"presence",role:"desktop",event:"offline"} 操纵同房别的
+        // 手机看到的桌面在线态横幅。照本函数 control.notify_hint（:879 一带）/input.ack
+        // （:889 一带）的既有 H1 姿势：只有 role==="desktop" 的连接才能广播 role:"desktop"
+        // 的 presence；伪造属于"拿着合法凭据乱来"的形态，计违规（同上面 scope 矩阵外帧
+        // 那条既有样式），不立即踢——攒够 PROTOCOL_VIOLATION_LIMIT 次才断。远端广播自己
+        // 真实角色的 presence（正常用法）不受影响。
+        if (payload.role === "desktop" && role !== "desktop") {
+          const exceeded = this.recordProtocolViolation(ws);
+          ws.send(JSON.stringify({ t: "error", reason: "role_forbidden", frame: "presence", role }));
+          if (exceeded) this.closeSocketForReauthorization(ws);
+          return;
+        }
         this.broadcastRaw(payload, ws);
         return;
+      }
       case "control.notify_hint":
         // 桌面 → relay，只带 {category}；转发给房间内在线远端。
         // 触发 Web Push 是 M5 的事，本单不做。
@@ -1684,6 +1737,18 @@ export class RoomDO {
     this.broadcastRaw({ t: "presence", role, event, ts: Date.now() }, excludeWs);
   }
 
+  // C1-PS（dogfood 修障第二批·手机发消息桌面离线无反馈）：定向投给单条刚接入的 remote socket——不走
+  // broadcastRaw/broadcastPresence（那两个会打给房间内全部符合投递闸的连接，
+  // 这里只该打给这一条新连接自己）。仍过 canDeliverOutbound 同一道投递闸——
+  // 跟 replayTo 对 replay.head/里程碑帧的既有纪律一致，不因为是"新连接自己"
+  // 就绕开检查。
+  sendDesktopPresenceSnapshot(ws, epoch) {
+    const online = this.onlineDesktopForEpoch(epoch) != null;
+    const frame = { t: "presence", role: "desktop", event: online ? "online" : "offline", ts: Date.now() };
+    if (!this.canDeliverOutbound(ws, frame)) return;
+    ws.send(JSON.stringify(frame));
+  }
+
   authorizeInboundSocket(ws, attachment, now = Date.now()) {
     if (attachment.subject_limit_closed === true) return false;
     if (attachment.scope === "desktop" && attachment.role !== "desktop") {
@@ -1786,6 +1851,28 @@ export class RoomDO {
     if (unclaimedState.owner_credential_hash == null && unclaimedState.created_at != null) {
       const reclaimAt = Number(unclaimedState.created_at) + UNCLAIMED_RECLAIM_MS;
       if (nearest == null || reclaimAt < nearest) nearest = reclaimAt;
+    }
+    // C1-TTL（dogfood 修障第二批·手机发消息桌面离线无反馈）：pending_input
+    // 暂存 TTL 到期时刻——第五类候选，同款「一处算一处设」结构。之前
+    // purgeExpiredPendingInput 只在 handleInput 高频路径里顺带触发，没有
+    // alarm 驱动的兜底——房间若从此再没有新 input 涌入，早该过期的暂存行会
+    // 一直滞留，手机端在这条通道上永远等不到 input.expired 回执。
+    const pendingInputExpiry = store.nextPendingInputExpiry(this.sql, now);
+    if (pendingInputExpiry != null) {
+      // R4（返工·TTL 死区）：`nextPendingInputExpiry` 用 `expires_at > now`（只看未来的
+      // 行），`purgeExpiredPendingInput`/`alarm()` 收尾清扫用 `expires_at < now`（只清
+      // 已过去的行）——`expires_at === now` 恰好落在两条查询的公共盲区之外：这一刻这行
+      // 既不算"未来"（不会被这里选中当下一次候选）也不算"过去"（不会被清扫删掉）。若
+      // alarm 精确排在 `expires_at` 这个时刻触发，`alarm()` 内那次 `Date.now()` 一旦
+      // 恰好等于它，两条查询都会漏掉这一行——它就永久滞留在 `pending_input` 里，
+      // `input.expired` 回执再也不会广播。这里把排的候选时刻定为 `expires_at + 1`
+      // （比真正到期时刻晚 1 毫秒）：保证 alarm 触发时 `Date.now() > expires_at`，
+      // 稳定落进 purge 那条 `<` 判据的真过去一侧。**不**改 `nextPendingInputExpiry`
+      // 本身的 `>` 为 `>=`——那会让还没真正过期（`expires_at === now` 那一刻）的行
+      // 立即被当"未来候选"选中、算出 `nearest === now`，与"已有相同/更早候选就不
+      // 重排"那条去重判断（下面几行）反复打架，形成 setAlarm 紧循环。
+      const candidate = pendingInputExpiry + 1;
+      if (nearest == null || candidate < nearest) nearest = candidate;
     }
     if (nearest != null) {
       // F3（T4 修复轮·整盘审实锤）：这个函数是全部武装点（失败 upgrade /

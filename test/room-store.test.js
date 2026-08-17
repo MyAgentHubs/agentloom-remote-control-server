@@ -391,6 +391,50 @@ test("同一 command_id 重复入队不产生第二行（去重）", () => {
   assert.equal(deliverable.length, 1);
 });
 
+// C1-RQ（dogfood 修障第二批）：enqueueInput 现在带回本次入队实际生效的
+// expires_at——room-do.js handleInput 拿它拼 input.relay_queued 确认帧。
+test("enqueueInput 返回 { expiresAt: now + ttlMs }", () => {
+  const sql = freshSql();
+  const result = store.enqueueInput(sql, {
+    commandId: "c1", session: "s1", envelopeJson: "{}", now: 1000, ttlMs: 5000,
+  });
+  assert.deepEqual(result, { expiresAt: 6000 });
+});
+
+// ---- getPendingInputExpiry（C1-RQ：幂等命中回执要用的既存行 expires_at） ----
+
+test("getPendingInputExpiry 对已存在的行返回其 expires_at", () => {
+  const sql = freshSql();
+  store.enqueueInput(sql, { commandId: "c1", session: "s1", envelopeJson: "{}", now: 1000, ttlMs: 5000 });
+  assert.equal(store.getPendingInputExpiry(sql, "c1"), 6000);
+});
+
+test("getPendingInputExpiry 对不存在的 command_id 返回 null", () => {
+  const sql = freshSql();
+  assert.equal(store.getPendingInputExpiry(sql, "never-enqueued"), null);
+});
+
+// ---- nextPendingInputExpiry（C1-TTL：scheduleNextTokenAlarm 第五类候选） ----
+
+test("nextPendingInputExpiry 返回未来到期时刻里最早的一个", () => {
+  const sql = freshSql();
+  store.enqueueInput(sql, { commandId: "later", session: "s1", envelopeJson: "{}", now: 1000, ttlMs: 9000 });
+  store.enqueueInput(sql, { commandId: "earlier", session: "s1", envelopeJson: "{}", now: 1000, ttlMs: 3000 });
+  assert.equal(store.nextPendingInputExpiry(sql, 500), 4000); // "earlier" 的 expires_at
+});
+
+test("nextPendingInputExpiry 忽略已过期的行，只看未来", () => {
+  const sql = freshSql();
+  store.enqueueInput(sql, { commandId: "already-expired", session: "s1", envelopeJson: "{}", now: 1000, ttlMs: 1000 });
+  store.enqueueInput(sql, { commandId: "still-future", session: "s1", envelopeJson: "{}", now: 1000, ttlMs: 9000 });
+  assert.equal(store.nextPendingInputExpiry(sql, 2500), 10000); // 只看 expires_at > 2500 的行
+});
+
+test("nextPendingInputExpiry 队列为空时返回 null", () => {
+  const sql = freshSql();
+  assert.equal(store.nextPendingInputExpiry(sql, Date.now()), null);
+});
+
 // ---- 配额计数器 ----
 
 test("getQuotaCount 未记录时为 0", () => {

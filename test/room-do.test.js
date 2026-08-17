@@ -354,6 +354,51 @@ test("remote 分支 replayTo 首帧仍是 replay.head（回归对照）", () => 
   assert.deepEqual(ws.sent[0], { t: "replay.head", epoch, headSeq: 1 });
 });
 
+// C1-PS（dogfood 修障第二批·手机发消息桌面离线无反馈）：remote 腿刚接入时
+// 拿不到当前桌面在线态快照——presence 帧只在状态变化时广播，新连接接入前
+// 发生的任何变化它都是盲的。room-do.js fetch() 在 replayTo 之后为
+// scope="remote" 连接定向调用 sendDesktopPresenceSnapshot；这里直接测这个
+// 被提取出来的方法本身（同 desktopHello/replayTo 既有先例——101 响应本身
+// 没法在 Node 里构造真实 WebSocketPair，这个文件测的是 fetch() 握手成功后
+// 会做的事，不是握手过程本身）。
+test("sendDesktopPresenceSnapshot：桌面在线时投一条 presence online 给这条新 remote 连接", () => {
+  const { room, ctx } = makeRoom();
+  connect(room, ctx, "desktop"); // registry_ready: true，epoch -> 1
+  const remoteWs = connect(room, ctx, "remote");
+
+  room.sendDesktopPresenceSnapshot(remoteWs, store.getCurrentEpoch(room.sql));
+
+  const frame = lastSent(remoteWs);
+  assert.equal(frame.t, "presence");
+  assert.equal(frame.role, "desktop");
+  assert.equal(frame.event, "online");
+});
+
+test("sendDesktopPresenceSnapshot：桌面离线时投一条 presence offline", () => {
+  const { room, ctx } = makeRoom();
+  const remoteWs = connect(room, ctx, "remote"); // 没有桌面连接
+
+  room.sendDesktopPresenceSnapshot(remoteWs, store.getCurrentEpoch(room.sql));
+
+  const frame = lastSent(remoteWs);
+  assert.equal(frame.t, "presence");
+  assert.equal(frame.role, "desktop");
+  assert.equal(frame.event, "offline");
+});
+
+test("sendDesktopPresenceSnapshot：只投给这条新 socket，不广播给房间里其它已在线的远端", () => {
+  const { room, ctx } = makeRoom();
+  connect(room, ctx, "desktop");
+  const bystanderWs = connect(room, ctx, "remote");
+  const newRemoteWs = connect(room, ctx, "remote");
+
+  room.sendDesktopPresenceSnapshot(newRemoteWs, store.getCurrentEpoch(room.sql));
+
+  assert.equal(bystanderWs.sent.length, 0, "旁观者远端不该收到这条定向快照");
+  assert.equal(newRemoteWs.sent.length, 1);
+  assert.equal(lastSent(newRemoteWs).event, "online");
+});
+
 test("旧库重启迁移后 replayTo 补发的历史 event 带合法 legacy client_msg_id", () => {
   const storageSql = makeStorageSql();
   storageSql.exec(`CREATE TABLE events (
@@ -508,6 +553,55 @@ test("kind=input：桌面离线时暂存进 pending_input 表", async () => {
   assert.equal(deliverable[0].command_id, "cmd-offline");
 });
 
+// C1-RQ（dogfood 修障第二批·手机发消息桌面离线无反馈）：桌面离线暂存成功后
+// 现在要回一条 input.relay_queued（不再一声不吭）——手机端才能知道「消息没
+// 丢，正在排队等桌面回来」而不是傻等一个永远不来的确认。
+test("kind=input：桌面离线暂存成功后回 input.relay_queued（带 command_id + expires_at）", async () => {
+  const { room, ctx } = makeRoom();
+  const remoteWs = connect(room, ctx, "remote");
+
+  const before = Date.now();
+  await send(room, remoteWs, envelope({ kind: "input", command_id: "cmd-relay-queued", seq: null, epoch: 0 }));
+
+  const reply = lastSent(remoteWs);
+  assert.equal(reply.t, "input.relay_queued");
+  assert.equal(reply.command_id, "cmd-relay-queued");
+  assert.ok(
+    Number.isSafeInteger(reply.expires_at) && reply.expires_at > before,
+    "expires_at 应是一个真实的、晚于入队时刻的未来到期时刻"
+  );
+});
+
+test("kind=input：同一 command_id 幂等重发也回 input.relay_queued（既存行的 expires_at，不重插）", async () => {
+  const { room, ctx } = makeRoom();
+  const remoteWs = connect(room, ctx, "remote");
+
+  await send(room, remoteWs, envelope({ kind: "input", command_id: "cmd-retry", seq: null, epoch: 0 }));
+  const first = lastSent(remoteWs);
+  assert.equal(first.t, "input.relay_queued");
+
+  await send(room, remoteWs, envelope({ kind: "input", command_id: "cmd-retry", seq: null, epoch: 0 }));
+  const second = lastSent(remoteWs);
+
+  assert.equal(second.t, "input.relay_queued");
+  assert.equal(second.command_id, "cmd-retry");
+  assert.equal(second.expires_at, first.expires_at, "幂等命中应回既存行原本的 expires_at，不是重新算出的新时刻");
+
+  const { deliverable } = store.drainDeliverableInput(room.sql, Date.now());
+  assert.equal(deliverable.length, 1, "幂等重试不该在表里多插一行");
+});
+
+test("kind=input：桌面在线直转时不回 input.relay_queued（只有离线暂存才回）", async () => {
+  const { room, ctx } = makeRoom();
+  const desktopWs = connect(room, ctx, "desktop");
+  const remoteWs = connect(room, ctx, "remote");
+
+  await send(room, remoteWs, envelope({ kind: "input", command_id: "cmd-online-2", seq: null }));
+
+  assert.equal(desktopWs.sent.length, 1, "桌面应收到直转的 envelope");
+  assert.equal(remoteWs.sent.length, 0, "在线直转路径不该给发送方任何 relay_queued/ack 回执");
+});
+
 test("input.ack：桌面确认后清空 pending_input 里对应的行，并把回执广播给远端", async () => {
   const { room, ctx } = makeRoom();
   const remoteWs = connect(room, ctx, "remote");
@@ -652,6 +746,34 @@ test("H1：control.notify_hint 来自非 desktop（remote）被拒，不广播�
 
   assert.equal(lastSent(attackerRemote).reason, "role_forbidden");
   assert.equal(bystanderRemote.sent.length, 0); // 完全没收到
+});
+
+test("R3（返工·硬化）：远端伪造 role:\"desktop\" 的 presence 被拒绝，且不广播给房间内其它连接", async () => {
+  const { room, ctx } = makeRoom();
+  const attackerRemote = connect(room, ctx, "remote");
+  const bystanderRemote = connect(room, ctx, "remote");
+
+  await send(room, attackerRemote, { t: "presence", role: "desktop", event: "offline" });
+
+  assert.equal(lastSent(attackerRemote).reason, "role_forbidden");
+  assert.equal(lastSent(attackerRemote).frame, "presence");
+  assert.equal(bystanderRemote.sent.length, 0, "伪造帧不该被广播出去——别的手机不该看到这条假的桌面下线横幅");
+  // 「含计违规」——不是单纯回错误就完事，同 scope 矩阵外帧那条既有样式一样计入违规计数
+  // （攒够 PROTOCOL_VIOLATION_LIMIT 次才踢连接，见 recordProtocolViolation 头注）。
+  assert.equal(room.socketProtocolViolations.get(attackerRemote), 1, "伪造 desktop presence 应计入这条 socket 的违规计数");
+  assert.equal(room.pendingProtocolViolations, 1, "同一次调用也应计入房间聚合违规计数（尚未攒够批量落库）");
+});
+
+test("R3 防误伤：远端广播自己真实角色（role:\"remote\"）的 presence 不受影响，正常放行且不计违规", async () => {
+  const { room, ctx } = makeRoom();
+  const sender = connect(room, ctx, "remote");
+  const observer = connect(room, ctx, "remote");
+
+  await send(room, sender, { t: "presence", role: "remote", event: "online" });
+
+  assert.equal(observer.sent.length, 1, "正常的远端自报 presence 应照旧广播给其它在线连接");
+  assert.equal(observer.sent[0].t, "presence");
+  assert.equal(room.socketProtocolViolations.get(sender), undefined, "正常路径不应计入违规");
 });
 
 test("正向对照：role=desktop 发 kind=event / role=remote 发 kind=input 都正常放行", async () => {
@@ -1244,6 +1366,77 @@ test("SEC-3：未认领房与 refresh_requests 候选共存时，scheduleNextTok
   ctx.alarmLog.scheduled = null;
   await room.scheduleNextTokenAlarm();
   assert.equal(ctx.alarmLog.scheduled, reclaimAt, "回收候选更近时应赢得 min");
+});
+
+// ============================================================================
+// C1-TTL（dogfood 修障第二批·手机发消息桌面离线无反馈）：pending_input TTL
+// 到期时刻——scheduleNextTokenAlarm 第五类候选 + alarm() 到点清扫兜底。
+// ============================================================================
+
+test("scheduleNextTokenAlarm：pending_input 到期时刻是候选之一，比其它候选更近时赢得 min", async () => {
+  const { room, ctx } = makeRoom();
+  const now = Date.now();
+  const nearExpiry = now + 5_000;
+  store.enqueueInput(room.sql, {
+    commandId: "cmd-alarm-candidate", session: "s1", envelopeJson: "{}", now, ttlMs: 5_000,
+  });
+
+  await room.scheduleNextTokenAlarm(now);
+
+  // R4（返工·TTL 死区）：排的候选时刻是 `expires_at + 1`（不是 `expires_at` 本身）——
+  // 见 room-do.js::scheduleNextTokenAlarm 头注，`expires_at` 那一刻恰好落在
+  // nextPendingInputExpiry 的 `>` 与 purgeExpiredPendingInput 的 `<` 两条查询的公共
+  // 盲区，+1 保证 alarm 触发时稳定被清扫判据判定为"已过去"。
+  assert.equal(ctx.alarmLog.scheduled, nearExpiry + 1, "pending_input 的到期时刻+1ms 应赢得 min（房间没有更近的其它候选）");
+});
+
+test("R4（返工·TTL 死区）：expires_at 恰好等于 now 的边界时刻——排的候选仍是 expires_at+1，不是 expires_at 本身", () => {
+  const { room } = makeRoom();
+  const sql = room.sql;
+  const now = 10_000;
+  store.enqueueInput(sql, { commandId: "cmd-boundary", session: "s1", envelopeJson: "{}", now: now - 1_000, ttlMs: 1_000 });
+  // 这一行的 expires_at 恰好等于 now（10_000）——nextPendingInputExpiry 的 `expires_at > now`
+  // 判据对它是 false（不算"未来"），purgeExpiredPendingInput 的 `expires_at < now` 判据
+  // 对它也是 false（不算"过去"）：这正是 R4 要修的公共盲区，room-store.js 本身两条查询都
+  // 不变（brief 明确不改 nextPendingInputExpiry 为 `>=`），盲区靠 room-do.js 调用方
+  // 排候选时 +1 规避。
+  assert.equal(store.nextPendingInputExpiry(sql, now), null, "expires_at===now 时不被当作未来候选（room-store.js 本身行为不变）");
+  const purgedCommandIds = store.deleteExpiredPendingInput(sql, now);
+  assert.deepEqual(purgedCommandIds, [], "expires_at===now 时也不被当作已过去清扫（room-store.js 本身行为不变）——盲区真实存在");
+});
+
+test("alarm()：到点清扫过期 pending_input、广播 input.expired、并重排下一次 alarm 到剩余行的到期时刻", async () => {
+  const { room, ctx } = makeRoom();
+  const remoteWs = connect(room, ctx, "remote");
+  const now = Date.now();
+
+  // 一条早已过期、一条还有余量——只有过期那条该被清扫广播；alarm() 本身不
+  // 是被 handleInput 高频路径触发的（房间此刻没有任何新 input 涌入），这条
+  // 测试专门验证 C1-TTL 加的 alarm 驱动兜底，不是既有 handleInput 内联清扫。
+  store.enqueueInput(room.sql, {
+    commandId: "cmd-alarm-expired", session: "s1", envelopeJson: "{}", now: now - 10_000, ttlMs: 1_000,
+  });
+  store.enqueueInput(room.sql, {
+    commandId: "cmd-alarm-still-fresh", session: "s1", envelopeJson: "{}", now, ttlMs: 60_000,
+  });
+
+  await room.alarm();
+
+  const expiredFrames = remoteWs.sent.filter((frame) => frame.t === "input.expired");
+  assert.deepEqual(expiredFrames.map((frame) => frame.command_id), ["cmd-alarm-expired"]);
+
+  const { deliverable } = store.drainDeliverableInput(room.sql, Date.now());
+  assert.deepEqual(deliverable.map((row) => row.command_id), ["cmd-alarm-still-fresh"], "只清过期的那一行，未过期的原样留着");
+
+  assert.ok(ctx.alarmLog.scheduled != null, "alarm() 收尾应重排下一次 alarm");
+  assert.ok(
+    // R4（返工·TTL 死区）：排的候选是 `expires_at + 1`（见 room-do.js::
+    // scheduleNextTokenAlarm 头注），边界从 `now + 60_000` 松 1ms 到
+    // `now + 60_000 + 1`——原断言用的是「不晚于」这条宽松上界，本单只需要把
+    // 上界本身也跟着挪 1ms，不改这条测试要验的东西。
+    ctx.alarmLog.scheduled <= now + 60_000 + 1,
+    "重排的下一次 alarm 应不晚于还剩那条行的到期时刻+1ms（房间没有更近的其它候选）"
+  );
 });
 
 // ============================================================================

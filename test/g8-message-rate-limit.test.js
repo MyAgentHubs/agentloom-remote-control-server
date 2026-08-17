@@ -531,7 +531,10 @@ test("G8 3：pending_input 行数——255 行时再入 1 行成功", async () =
   // 桌面离线、从未 bumpEpoch 过，房间当前 epoch 恒为 0——envelope 必须显式
   // 对齐，否则会先撞 stale_epoch 短路，测不到本测试真正要测的行数闸。
   const actual = await send(room, remote, inputEnvelope({ command_id: "cmd-row-256", epoch: 0 }));
-  assert.equal(actual, undefined, "255 行时第 256 行应成功入队，不该有拒绝回执");
+  // C1-RQ（dogfood 修障第二批）：离线入队成功后现在回一条 input.relay_queued
+  // 确认帧（不再一声不吭）——不是拒绝回执，只是不再是 undefined。
+  assert.equal(actual.t, "input.relay_queued", "255 行时第 256 行应成功入队并回 relay_queued，不该有拒绝回执");
+  assert.equal(actual.command_id, "cmd-row-256");
   assert.equal(store.pendingInputStats(room.sql).rowCount, 256);
 });
 
@@ -651,7 +654,10 @@ test("G8 R6③：满队列同 command_id 重试——不收 queue_full（幂等�
   assert.equal(store.pendingInputStats(room.sql).rowCount, 256, "前置：队列已满 256 行，其中一行是待重试的那条");
 
   const actual = await send(room, remote, inputEnvelope({ command_id: "cmd-idempotent-retry", epoch: 0 }));
-  assert.equal(actual, undefined, "同 command_id 重试应静默放行，不该收到 queue_full");
+  // C1-RQ（dogfood 修障第二批）：幂等命中现在也回一条 input.relay_queued
+  // （拿既存行的 expires_at）——不是 queue_full，也不再是一声不吭。
+  assert.equal(actual.t, "input.relay_queued", "同 command_id 重试应回 relay_queued，不该收到 queue_full");
+  assert.equal(actual.command_id, "cmd-idempotent-retry");
   assert.equal(store.pendingInputStats(room.sql).rowCount, 256, "幂等重试不该让行数变化");
 });
 
@@ -867,7 +873,9 @@ test("G8 三审 R4：真实 fetch() 双次升级（close 第一条）+ 同 stora
     const ws1 = await realRemoteUpgrade(room, ctx, { token });
     for (let i = 1; i <= 20; i += 1) {
       const actual = await send(room, ws1, inputEnvelope({ epoch: 0 }));
-      assert.equal(actual, undefined, `重连前第 ${i} 帧应成功（真实 fetch() 升级出的连接）`);
+      // C1-RQ（dogfood 修障第二批）：桌面全程未连接——离线入队成功后现在
+      // 回一条 input.relay_queued（不再是一声不吭的 undefined）。
+      assert.equal(actual.t, "input.relay_queued", `重连前第 ${i} 帧应成功入队并回 relay_queued（真实 fetch() 升级出的连接）`);
     }
 
     // 真实关闭第一条连接——走生产 close 入口，不是随手扔掉不管。
@@ -882,7 +890,7 @@ test("G8 三审 R4：真实 fetch() 双次升级（close 第一条）+ 同 stora
 
     for (let i = 21; i <= 30; i += 1) {
       const actual = await send(room, ws2, inputEnvelope({ epoch: 0 }));
-      assert.equal(actual, undefined, `重连后累计第 ${i} 帧应仍在 30 帧配额内成功`);
+      assert.equal(actual.t, "input.relay_queued", `重连后累计第 ${i} 帧应仍在 30 帧配额内成功并回 relay_queued`);
     }
     const rejected = await send(room, ws2, inputEnvelope({ epoch: 0, command_id: "cmd-real-31st" }));
     assert.ok(rejected, "重连后累计第 31 条必须被拒——per-subject 配额没有因为断线重连被清零");

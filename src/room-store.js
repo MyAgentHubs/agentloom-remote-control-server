@@ -837,6 +837,18 @@ export function nextRefreshRequestDeadline(sql, now) {
   return value == null ? null : Number(value);
 }
 
+// C1-TTL（dogfood 修障第二批·手机发消息桌面离线无反馈）：pending_input 暂存
+// TTL 到期时刻——scheduleNextTokenAlarm 的候选之一，同款「一处算一处设」结构
+// （同 nextRefreshRequestDeadline）。只看未来（expires_at > now）的行，已过期
+// 的行不该把 alarm 钉在过去；hasTable 守卫同款理由——这个函数也可能在业务
+// schema 建立前的触发点被调到。
+export function nextPendingInputExpiry(sql, now) {
+  if (!hasTable(sql, "pending_input")) return null;
+  const rows = sql.exec("SELECT MIN(expires_at) AS next FROM pending_input WHERE expires_at > ?", now);
+  const value = rows.length ? rows[0].next : null;
+  return value == null ? null : Number(value);
+}
+
 // ---- pairing_routes（S1i3 F1·§9.5 第 235 行·relay 侧配对路由持久化） ----
 
 /**
@@ -1028,6 +1040,12 @@ export function replaySince(sql, lastSeq) {
 
 const DEFAULT_INPUT_TTL_MS = 30 * 60 * 1000; // 30 分钟
 
+// C1-RQ（dogfood 修障第二批·手机发消息桌面离线无反馈）：返回本次入队实际
+// 生效的 expires_at——调用方（room-do.js handleInput）在成功入队后要拿这个
+// 时刻回一条 input.relay_queued 帧告知发送方「已暂存、什么时候过期」。调用方
+// 保证进这里之前已经确认过 command_id 不在表里（见 getPendingInputExpiry 那条
+// 幂等分支），所以 ON CONFLICT DO NOTHING 在这条路径上恒不触发——返回值就是
+// 这次真正写入的 now + ttlMs，不是「可能是旧行的原值」。
 export function enqueueInput(sql, {
   commandId,
   session,
@@ -1037,6 +1055,7 @@ export function enqueueInput(sql, {
   generation = null,
   ttlMs = DEFAULT_INPUT_TTL_MS,
 }) {
+  const expiresAt = now + ttlMs;
   sql.exec(
     "INSERT INTO pending_input " +
       "(command_id, session, envelope, created_at, expires_at, subject, generation) VALUES (?, ?, ?, ?, ?, ?, ?) " +
@@ -1045,10 +1064,11 @@ export function enqueueInput(sql, {
     session ?? null,
     envelopeJson,
     now,
-    now + ttlMs,
+    expiresAt,
     subject,
     generation
   );
+  return { expiresAt };
 }
 
 /**
@@ -1113,9 +1133,14 @@ export function removePendingInput(sql, commandId) {
 // 容量闸会在到达 enqueueInput 之前就先拦下这次重试、回一个名不副实的
 // queue_full——这个函数让调用方能在容量判断之前先甄别「这其实是已经成功
 // 过的同一条重试」，把它从容量判断里摘出来。
-export function hasPendingInputCommandId(sql, commandId) {
-  const rows = sql.exec("SELECT 1 AS present FROM pending_input WHERE command_id = ? LIMIT 1", commandId);
-  return rows.length > 0;
+// C1-RQ（dogfood 修障第二批·手机发消息桌面离线无反馈）：从布尔判存在改成
+// 直接带回 expires_at——幂等命中时 room-do.js handleInput 现在要用既存行的
+// expires_at 回一条 input.relay_queued 确认帧（不是原来的一声不吭 return），
+// 单查一次比「先 hasPendingInputCommandId 判存在、命中了再查一次
+// expires_at」省一趟 SQL。
+export function getPendingInputExpiry(sql, commandId) {
+  const rows = sql.exec("SELECT expires_at FROM pending_input WHERE command_id = ? LIMIT 1", commandId);
+  return rows.length ? Number(rows[0].expires_at) : null;
 }
 
 // G8（C1 设计 v0.5 §8·消息期限速）：入队前查该房现存 pending_input 行数与

@@ -275,6 +275,66 @@ test("relay 过期 pending_input 行经 webSocketMessage 触发清扫并广播 i
 });
 
 // ============================================================================
+// input.relay_queued（R6·返工·契约样张补位——ff96acac 引入的新帧型，之前没有 fixture 消费方，
+// remote-web 只有自造语料）
+// ============================================================================
+//
+// 该帧有三个字段：t / command_id / expires_at。前两个可以逐值钉死（跟 input.ack/input.expired
+// 的既有做法一致：驱动方用 fixture 的 command_id 现造一条真实状态）；`expires_at` 是
+// `Date.now() + TTL` 现算出来的（room-do.js::handleInput 的新入队分支直接调
+// `Date.now()`，测试拿不到注入点）——fixture 里的 `1800000000000` 是"假值中性"的占位数，
+// 不代表这条分支必须精确复现它，所以这条分支的断言只钉字段名/类型（形状），不钉字面值。
+// 幂等命中分支不同：`existingExpiry` 直接来自测试自己预先 `store.enqueueInput()` 时传入的
+// `now`/`ttlMs`，可以精确控制，这里让它俩相加正好等于 fixture 的 `1800000000000`，因此这条
+// 分支能做到跟其它 fixture case 一样的逐字段 deepEqual。
+
+test("relay input：桌面离线时 handleInput 入队回一条 input.relay_queued，帧形状与样张深比对", async () => {
+  const { room, ctx } = makeRoom();
+  const remoteWs = connect(room, ctx, "remote"); // 桌面不上线，走新入队分支。
+  const fixtureFrame = fixtureCase("input_relay_queued").frame;
+
+  await send(room, remoteWs, envelope({
+    kind: "input", command_id: fixtureFrame.command_id, seq: null, epoch: 0,
+  }));
+
+  const reply = lastSent(remoteWs);
+  assert.deepEqual(
+    Object.keys(reply).sort(),
+    Object.keys(fixtureFrame).sort(),
+    "字段集合（形状）必须与样张一致——t/command_id/expires_at 三个键，不多不少"
+  );
+  assert.equal(reply.t, fixtureFrame.t);
+  assert.equal(reply.command_id, fixtureFrame.command_id);
+  assert.equal(typeof reply.expires_at, "number");
+  assert.ok(Number.isFinite(reply.expires_at), "expires_at 必须是有限数字（Date.now()+TTL 现算值,不追求跟样张字面值相等）");
+});
+
+test("relay input：同 command_id 幂等命中回一条既存行 expires_at 的 input.relay_queued，帧形状与样张深比对", async () => {
+  const { room, ctx } = makeRoom();
+  const remoteWs = connect(room, ctx, "remote");
+  const fixtureFrame = fixtureCase("input_relay_queued").frame;
+
+  // 预先种一条既存 pending_input 行——now=0、ttlMs=fixture 的 expires_at 字面值，使
+  // enqueueInput 算出的 expiresAt 恰好等于样张的 expires_at（这条分支读的是既存行的值，
+  // 不是重新计算，测试因此能精确控制它,与 input.ack/input.expired 既有做法一致地逐字段
+  // deepEqual）。
+  store.enqueueInput(room.sql, {
+    commandId: fixtureFrame.command_id,
+    session: "s1",
+    envelopeJson: JSON.stringify({ seed: 0 }),
+    now: 0,
+    ttlMs: fixtureFrame.expires_at,
+  });
+  assert.equal(store.getPendingInputExpiry(room.sql, fixtureFrame.command_id), fixtureFrame.expires_at, "前置：种下的既存行 expires_at 精确等于样张字面值");
+
+  await send(room, remoteWs, envelope({
+    kind: "input", command_id: fixtureFrame.command_id, seq: null, epoch: 0,
+  }));
+
+  assert.deepEqual(lastSent(remoteWs), fixtureFrame, "幂等命中分支回的帧应与样张逐字段完全一致（command_id 复用、expires_at 取既存行精确值）");
+});
+
+// ============================================================================
 // replay.head
 // ============================================================================
 
